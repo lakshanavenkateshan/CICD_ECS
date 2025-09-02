@@ -1,0 +1,60 @@
+pipeline {
+  agent any
+  environment {
+    AWS_ACCOUNT_ID = '123456789012'     // <-- replace with your account id
+    AWS_REGION     = 'ap-south-1'
+    ECR_REPOSITORY = 'hello-app'
+    ECS_CLUSTER    = 'hello-cluster'
+    ECS_SERVICE    = 'hello-service'
+    TASK_FAMILY    = 'hello-task'
+    CONTAINER_NAME = 'hello-container'
+    SHORT_SHA = "${env.GIT_COMMIT?.take(7) ?: 'local'}"
+    ECR_URI   = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${SHORT_SHA}"
+  }
+  stages {
+    stage('Clone') { steps { checkout scm } }
+    stage('Test') {
+      steps {
+        sh 'set -eux; node -v || true; npm ci || npm install; npm test'
+      }
+    }
+    stage('Build') {
+      steps {
+        sh 'set -eux; docker build -t "${ECR_URI}" .; docker image inspect "${ECR_URI}" -f "{{.Id}}" > image-digest.txt || true'
+      }
+    }
+    stage('Artifact') {
+      steps {
+        sh 'mkdir -p artifact; echo "${ECR_URI}" > artifact/image-tag.txt; mv image-digest.txt artifact/ || true'
+        archiveArtifacts artifacts: 'artifact/**', fingerprint: true
+      }
+    }
+    stage('ECR') {
+      steps {
+        sh '''
+          set -eux
+          aws ecr get-login-password --region "${AWS_REGION}" | \
+            docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          aws ecr describe-repositories --repository-names "${ECR_REPOSITORY}" --region "${AWS_REGION}" >/dev/null 2>&1 || \
+            aws ecr create-repository --repository-name "${ECR_REPOSITORY}" --region "${AWS_REGION}"
+          docker push "${ECR_URI}"
+        '''
+      }
+    }
+    stage('ECS Deployment') {
+      steps {
+        sh '''
+          set -eux
+          CURRENT_TD_ARN=$(aws ecs describe-services --cluster "${ECS_CLUSTER}" --services "${ECS_SERVICE}" --region "${AWS_REGION}" --query 'services[0].taskDefinition' --output text)
+          aws ecs describe-task-definition --task-definition "${CURRENT_TD_ARN}" --region "${AWS_REGION}" --query 'taskDefinition' > td.json
+          cat td.json | jq ".containerDefinitions |= map(if .name==\"${CONTAINER_NAME}\" then .image=\"${ECR_URI}\" else . end)" | \
+            jq 'del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' > new-td.json
+          NEW_TD_ARN=$(aws ecs register-task-definition --cli-input-json file://new-td.json --region "${AWS_REGION}" --query 'taskDefinition.taskDefinitionArn' --output text)
+          aws ecs update-service --cluster "${ECS_CLUSTER}" --service "${ECS_SERVICE}" --task-definition "${NEW_TD_ARN}" --force-new-deployment --region "${AWS_REGION}"
+          aws ecs wait services-stable --cluster "${ECS_CLUSTER}" --services "${ECS_SERVICE}" --region "${AWS_REGION}"
+        '''
+      }
+    }
+  }
+  post { always { sh 'docker system prune -af || true' } }
+}
